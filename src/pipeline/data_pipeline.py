@@ -1,3 +1,15 @@
+"""
+Dataset preparation utilities for email classification workflows.
+
+This module provides helpers for summarizing parsed email records,
+filtering low-quality data, and converting records into pandas DataFrames
+ready for modeling.
+
+It builds on the preprocessing and data loading layers to support
+end-to-end dataset preparation, including basic quality checks,
+length-based filtering, and final dataset construction.
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -6,8 +18,8 @@ from typing import Optional
 
 import pandas as pd
 
-from src.data.load_data import build_enron_records
-from src.data.preprocess import EmailRecord, PreprocessingConfig
+from ..data.load_data import build_enron_records
+from ..data.preprocess import EmailRecord, PreprocessingConfig
 
 
 def summarize_records(records: list[EmailRecord]) -> dict:
@@ -68,7 +80,7 @@ def print_summary(summary: dict) -> None:
     print("Min length:", summary["min_length"])
     print("Max length:", summary["max_length"])
     print("Avg length:", summary["avg_length"])
-    
+
 
 def filter_records(
     records: list[EmailRecord],

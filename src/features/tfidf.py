@@ -1,7 +1,7 @@
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 
-# builds the vectorizer with the given params
+# Builds the vectorizer with the given params
 def build_tfidf(
     max_features: int = 50_000,
     ngram_range: tuple[int, int] = (1, 2),
@@ -18,11 +18,11 @@ def build_tfidf(
     )
 
 
-# fits on training text and returns the tfidf matrix
+# Fits on training text and returns the tfidf matrix
 def fit_transform_tfidf(texts: list[str], vectorizer: TfidfVectorizer):
     return vectorizer.fit_transform(texts)
 
 
-# transforms new text using the already fitted vectorizer
+# Transforms new text using the already fitted vectorizer
 def transform_tfidf(texts: list[str], vectorizer: TfidfVectorizer):
     return vectorizer.transform(texts)

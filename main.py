@@ -6,7 +6,7 @@
 # falls back to data/raw/enron/ for raw parsing.
 
 from __future__ import annotations
-
+import matplotlib.pyplot as plt
 import argparse
 from pathlib import Path
 
@@ -86,15 +86,45 @@ def run_pipeline(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 4
     print(f"{'Model':<25} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10}")
     print("-" * 67)
 
+    results = []
+
     for name, train_fn in models.items():
         model = train_fn(X_train, y_train)
         metrics = evaluate_model(model, X_test, y_test)
+
+        results.append({
+            "Model": name,
+            "Accuracy": metrics["accuracy"],
+            "Precision": metrics["precision"],
+            "Recall": metrics["recall"],
+            "F1": metrics["f1"],
+        })
         print(
             f"{name:<25} {metrics['accuracy']:>10.4f} {metrics['precision']:>10.4f} "
             f"{metrics['recall']:>10.4f} {metrics['f1']:>10.4f}"
         )
 
     print()
+
+    results_df = pd.DataFrame(results)
+
+    results_dir = PROJECT_ROOT / "reports" / "results"
+    figures_dir = PROJECT_ROOT / "reports" / "figures"
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save CSV
+    results_df.to_csv(results_dir / "baseline_model_comparison.csv", index=False)
+
+    # Create chart
+    ax = results_df.set_index("Model")[["Accuracy", "Precision", "Recall", "F1"]].plot(kind="bar")
+    plt.title("Model Comparison")
+    plt.ylabel("Score")
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    plt.savefig(figures_dir / "baseline_model_comparison.png")
+    plt.close()
 
 
 # Parse CLI arguments and run the full pipeline.

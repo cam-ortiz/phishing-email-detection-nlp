@@ -18,8 +18,30 @@ from typing import Optional
 
 import pandas as pd
 
-from ..data.load_data import build_enron_records
+from ..data.load_data import build_enron_records, build_nazario_records
 from ..data.preprocess import EmailRecord, PreprocessingConfig
+
+
+def build_nazario_modeling_dataframe(
+    data_root: Path,
+    config: Optional[PreprocessingConfig] = None,
+    min_length: int = 10,
+    drop_empty: bool = True,
+    modeling_only: bool = True,
+) -> tuple[list[EmailRecord], list[EmailRecord], dict, pd.DataFrame]:
+    """
+    Build, summarize, filter, and convert Nazario phishing records for modeling.
+    """
+    records = build_nazario_records(data_root, config=config)
+    summary = summarize_records(records)
+    filtered_records = filter_records(
+        records,
+        min_length=min_length,
+        drop_empty=drop_empty,
+    )
+    df = records_to_dataframe(filtered_records, modeling_only=modeling_only)
+
+    return records, filtered_records, summary, df
 
 
 def summarize_records(records: list[EmailRecord]) -> dict:

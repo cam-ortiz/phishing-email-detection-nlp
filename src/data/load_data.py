@@ -13,8 +13,102 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import pandas as pd
+import mailbox
 
-from src.data.preprocess import PreprocessingConfig, parse_email_file, EmailRecord
+from src.data.preprocess import (
+    PreprocessingConfig, 
+    parse_email_file, 
+    EmailRecord,
+    extract_visible_body_from_message,
+    strip_quoted_reply_chain,
+    normalize_whitespace,
+    finalize_email_text,
+   )
+
+
+def parse_email_message(
+    msg,
+    path: str,
+    config: Optional[PreprocessingConfig] = None,
+) -> EmailRecord:
+    """
+    Parse a single mailbox message into an EmailRecord directly from the
+    mailbox message object.
+    """
+    cfg = config or PreprocessingConfig()
+
+    try:
+        subject = msg.get("Subject", "") or ""
+        subject = normalize_whitespace(str(subject))
+
+        body = extract_visible_body_from_message(
+            msg,
+            convert_html=cfg.convert_html,
+        )
+
+        parse_success = True
+        error = ""
+        fallback_type = "none"
+
+    except Exception as exc:
+        subject = ""
+        body = ""
+        parse_success = False
+        error = f"parse_error: {exc}"
+        fallback_type = "message_parse_error"
+
+    if cfg.strip_reply_chains:
+        stripped_body = strip_quoted_reply_chain(body)
+        if stripped_body.strip():
+            body = stripped_body
+
+    body = normalize_whitespace(body)
+
+    combined_text = normalize_whitespace(
+        f"{subject}\n\n{body}".strip()
+    )
+    combined_text = finalize_email_text(
+        combined_text,
+        min_length=cfg.min_text_length,
+        max_length=cfg.max_text_length,
+    ) or ""
+
+    return EmailRecord(
+        path=path,
+        subject=subject,
+        body=body,
+        text=combined_text,
+        parse_success=parse_success,
+        used_fallback=False,
+        error=error,
+        raw_text=None,
+        fallback_type=fallback_type,
+    )
+
+
+def build_nazario_records(
+    data_root: Path,
+    config: Optional[PreprocessingConfig] = None,
+) -> list[EmailRecord]:
+    """
+    Build labeled phishing records from Nazario .mbox files.
+    """
+    records: list[EmailRecord] = []
+
+    for mbox_path in sorted(data_root.glob("*.mbox")):
+        mbox = mailbox.mbox(mbox_path)
+
+        for i, msg in enumerate(mbox):
+            record = parse_email_message(
+                msg,
+                path=f"{mbox_path.name}::message_{i}",
+                config=config,
+            )
+            record.label = 1
+            record.label_name = "phishing"
+            records.append(record)
+
+    return records
 
 
 def iter_email_files(root: Path) -> Iterator[Path]:

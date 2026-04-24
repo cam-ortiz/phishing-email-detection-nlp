@@ -1,16 +1,29 @@
-# Entry point for the phishing/spam email classification pipeline.
-# Compatible with two types of datasets:
-#   1. Pre-processed CSV  (--csv path/to/file.csv)
-#   2. Raw Enron email dirs (--enron path/to/enron_root)
-# Default: looks for data/processed/enron_clean.csv, then
-# falls back to data/raw/enron/ for raw parsing.
+"""
+Command-line entry point for the phishing/spam classification pipeline.
+
+This module supports three dataset modes:
+
+1. Enron ham/spam classification.
+2. Phishing detection using Enron legitimate emails and Nazario phishing emails.
+3. A custom preprocessed CSV containing ``text`` and ``label`` columns.
+
+The pipeline loads data, validates the modeling dataframe, optionally balances
+classes, builds TF-IDF features, trains baseline models, evaluates them, and
+saves comparison results.
+"""
+
 
 from __future__ import annotations
-import matplotlib.pyplot as plt
-import argparse
-from pathlib import Path
 
+import argparse
+import logging
+from pathlib import Path
+from typing import Callable
+
+import matplotlib.pyplot as plt
 import pandas as pd
+from scipy.sparse import spmatrix
+from sklearn.base import ClassifierMixin
 from sklearn.model_selection import train_test_split
 
 from src.features.tfidf import build_tfidf, fit_transform_tfidf, transform_tfidf
@@ -28,40 +41,131 @@ from src.pipeline.data_pipeline import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
 DEFAULT_CSV = PROJECT_ROOT / "data" / "processed" / "enron_clean.csv"
 DEFAULT_ENRON_RAW = PROJECT_ROOT / "data" / "raw" / "enron"
 
-DEFAULT_NAZARIO_CSV = PROJECT_ROOT / "data" / "processed" / "nazario_clean_dedup.csv"
+DEFAULT_NAZARIO_CSV = PROJECT_ROOT / "data" / "processed" / "nazario_clean.csv"
 DEFAULT_NAZARIO_RAW = PROJECT_ROOT / "data" / "raw" / "nazario"
-DEFAULT_BALANCED_CSV = PROJECT_ROOT / "data" / "processed" / "phishing_legit_balanced.csv"
+
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "reports" / "results"
+DEFAULT_FIGURES_DIR = PROJECT_ROOT / "reports" / "figures"
+
+REQUIRED_COLUMNS = {"text", "label"}
+
+logger = logging.getLogger(__name__)
+
+ModelTrainer = Callable[[spmatrix, pd.Series], ClassifierMixin]
 
 
-def clean_loaded_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.dropna(subset=["text"])
-    df = df[df["text"].str.strip().astype(bool)]
-    df = df.drop_duplicates(subset=["text"]).reset_index(drop=True)
+def configure_logging(level: int = logging.INFO) -> None:
+    """
+    Configure application logging.
+    """
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+    )    
+    
+
+def print_section(title: str) -> None:
+    print(f"\n=== {title} ===")
+    
+
+def validate_modeling_dataframe(df: pd.DataFrame) -> None:
+    """
+    Validate that a dataframe can be used for model training.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Dataframe to validate.
+
+    Raises
+    ------
+    ValueError
+        If required columns are missing or the label column has fewer than two
+        unique classes.
+    """
+    missing_columns = REQUIRED_COLUMNS - set(df.columns)
+    
+    if missing_columns:
+        raise ValueError(
+            "Dataframe is missing required columns: "
+            f"{sorted(missing_columns)}. Expected columns: {sorted(REQUIRED_COLUMNS)}"
+        )
+
+    if df["label"].nunique() < 2:
+        raise ValueError(
+            "The dataset must contain at least two classes for training."
+        )
+    
+    
+def prepare_modeling_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean and standardize a modeling dataframe.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe containing at least ``text`` and ``label`` columns.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Cleaned dataframe containing only non-empty, deduplicated text rows.
+
+    Raises
+    ------
+    ValueError
+        If the dataframe does not contain the required columns.
+    """
+    validate_modeling_dataframe(df)
+    
+    cleaned_df = df.copy()
+    
+    cleaned_df = cleaned_df.dropna(subset=["text", "label"])
+    cleaned_df["text"] = cleaned_df["text"].astype(str)
+    cleaned_df = cleaned_df[cleaned_df["text"].str.strip().astype(bool)]
+
+    cleaned_df = (
+        cleaned_df.drop_duplicates(subset=["text"])
+        .reset_index(drop=True)
+    )
     return df
 
 
-def maybe_balance_dataframe(
-    df: pd.DataFrame,
-    balanced: bool,
-    random_state: int,
-) -> pd.DataFrame:
-    if not balanced:
-        return df
+def balance_classes(df: pd.DataFrame, random_state: int) -> pd.DataFrame:
+    """
+    Downsample all classes to match the smallest class size.
 
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Modeling dataframe containing ``text`` and ``label`` columns.
+    random_state : int
+        Random seed used for reproducible sampling.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Class-balanced dataframe.
+    """
     counts = df["label"].value_counts()
     min_class_size = counts.min()
+    
+    logger.info("Balancing classes to %s rows per class.", min_class_size)
 
     balanced_parts = []
 
     for label_value in counts.index:
         label_df = df[df["label"] == label_value]
+        
         sampled_df = label_df.sample(
             n=min_class_size,
             random_state=random_state,
         )
+        
         balanced_parts.append(sampled_df)
 
     df_balanced = (
@@ -74,21 +178,43 @@ def maybe_balance_dataframe(
 
 
 def load_enron_dataframe(args: argparse.Namespace) -> pd.DataFrame:
+    """
+    Load the Enron dataset from raw files or a default processed CSV.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Enron modeling dataframe.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no Enron source can be found.
+    """
     if args.enron:
         enron_path = Path(args.enron)
-        print(f"Parsing raw Enron emails from: {enron_path}")
+        logger.info("Parsing raw Enron emails from: %s", enron_path)
+        
         _, _, summary, df = build_enron_modeling_dataframe(enron_path)
         print_summary(summary)
+        
         return df
 
     elif DEFAULT_CSV.exists():
-        print(f"Loading CSV: {DEFAULT_CSV}")
+        logger.info("Loading Enron CSV: %s", DEFAULT_CSV)
         return pd.read_csv(DEFAULT_CSV)
 
     elif DEFAULT_ENRON_RAW.exists():
-        print(f"Parsing raw Enron emails from: {DEFAULT_ENRON_RAW}")
+        logger.info("Parsing raw Enron emails from: %s", DEFAULT_ENRON_RAW)
+
         _, _, summary, df = build_enron_modeling_dataframe(DEFAULT_ENRON_RAW)
         print_summary(summary)
+
         return df
 
     raise FileNotFoundError(
@@ -98,21 +224,43 @@ def load_enron_dataframe(args: argparse.Namespace) -> pd.DataFrame:
 
 
 def load_nazario_dataframe(args: argparse.Namespace) -> pd.DataFrame:
+    """
+    Load the Nazario phishing dataset from raw files or processed CSV.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Nazario modeling dataframe.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no Nazario source can be found.
+    """
     if args.nazario:
         nazario_path = Path(args.nazario)
-        print(f"Parsing raw Nazario emails from: {nazario_path}")
+        logger.info("Parsing raw Nazario emails from: %s", nazario_path)
+        
         _, _, summary, df = build_nazario_modeling_dataframe(nazario_path)
         print_summary(summary)
+        
         return df
 
     elif DEFAULT_NAZARIO_CSV.exists():
-        print(f"Loading CSV: {DEFAULT_NAZARIO_CSV}")
+        logger.info("Loading Nazario CSV: %s", DEFAULT_NAZARIO_CSV)
         return pd.read_csv(DEFAULT_NAZARIO_CSV)
 
     elif DEFAULT_NAZARIO_RAW.exists():
-        print(f"Parsing raw Nazario emails from: {DEFAULT_NAZARIO_RAW}")
+        logger.info("Parsing raw Nazario emails from: %s", DEFAULT_NAZARIO_RAW)
+
         _, _, summary, df = build_nazario_modeling_dataframe(DEFAULT_NAZARIO_RAW)
         print_summary(summary)
+
         return df
 
     raise FileNotFoundError(
@@ -121,36 +269,73 @@ def load_nazario_dataframe(args: argparse.Namespace) -> pd.DataFrame:
     )
     
     
-def build_phishing_dataframe(
+def build_phishing_vs_legit_dataframe(
     enron_df: pd.DataFrame,
     nazario_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    # Keep only legitimate Enron emails
-    enron_ham_df = enron_df[enron_df["label"] == 0].copy()
+    """
+    Build a phishing detection dataframe from Enron and Nazario data.
+
+    Enron emails labeled ``0`` are treated as legitimate emails. Nazario emails
+    are treated as phishing emails and assigned label ``1``.
+
+    Parameters
+    ----------
+    enron_df : pandas.DataFrame
+        Enron dataframe containing ``text`` and ``label`` columns.
+    nazario_df : pandas.DataFrame
+        Nazario dataframe containing a ``text`` column.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Combined dataframe with ``text`` and ``label`` columns.
+    """
+    validate_modeling_dataframe(enron_df)
     
-    print("Enron columns:", enron_ham_df.columns.tolist())
-    print(enron_ham_df.head())
+    if "text" not in nazario_df.columns:
+        raise ValueError("Nazario dataframe must contain a 'text' column.")
+        
+    # Use only legitimate Enron messages as the non-phishing class.
+    enron_ham_df = enron_df.loc[enron_df["label"] == 0, ["text", "label"]].copy()
 
-    print("nazario columns:", nazario_df.columns.tolist())
-    print(nazario_df.head())
-
-    # Nazario should already be phishing label 1, but copy to be safe
-    nazario_df = nazario_df.copy()
-    nazario_df["label"] = 1
-
+    # Nazario records are phishing records for this experiment.
+    nazario_phishing_df = nazario_df[["text"]].copy()
+    nazario_phishing_df["label"] = 1
+    
     combined_df = pd.concat(
-        [enron_ham_df[["text", "label"]], nazario_df[["text", "label"]]],
+        [enron_ham_df, nazario_phishing_df],
         ignore_index=True,
+    )
+
+    logger.info(
+        "Built phishing dataframe with %s Enron ham rows and %s Nazario phishing rows.",
+        len(enron_ham_df),
+        len(nazario_phishing_df),
     )
 
     return combined_df
 
 
-# Resolve the data source and return a DataFrame with 'text' and 'label' columns.
 def load_dataframe(args: argparse.Namespace) -> pd.DataFrame:
+    """
+    Load and prepare a dataframe based on CLI arguments.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Cleaned and optionally balanced modeling dataframe.
+    """
+    print_section("Loading Data")
+    
     if args.csv:
         csv_path = Path(args.csv)
-        print(f"Loading CSV: {csv_path}")
+        logger.info("Loading CSV: %s", csv_path)
         df = pd.read_csv(csv_path)
         
     elif args.dataset == "enron":
@@ -159,37 +344,134 @@ def load_dataframe(args: argparse.Namespace) -> pd.DataFrame:
     elif args.dataset == "phishing":
         enron_df = load_enron_dataframe(args)
         nazario_df = load_nazario_dataframe(args)
-        df = build_phishing_dataframe(enron_df, nazario_df)
+        
+        df = build_phishing_vs_legit_dataframe(
+            enron_df=enron_df,
+            nazario_df=nazario_df,
+        )
 
     else:
         raise ValueError(f"Unsupported dataset option: {args.dataset}")
 
-    print("Before clean:", df.columns.tolist())
-    df = clean_loaded_dataframe(df)
+    df = prepare_modeling_dataframe(df)
     
-    print("After clean:", df.columns.tolist())
-    df = maybe_balance_dataframe(
-        df,
-        balanced=args.balanced,
-        random_state=args.seed,
+    print_section("Preprocessing")
+    
+    logger.info("After cleaning: %s rows.", len(df))
+    logger.info(
+        "Class counts before balancing: %s",
+        df["label"].value_counts().to_dict(),
     )
-    print("After balance:", df.columns.tolist())
+
+    if args.balanced:
+        logger.info("Applying class balancing...")
+        df = balance_classes(df, random_state=args.seed)
+
+    logger.info("Final dataset size: %s rows.", len(df))
+    logger.info(
+        "Final class counts: %s",
+        df["label"].value_counts().to_dict(),
+    )
 
     return df
 
 
-# TF-IDF vectorization, train/test split, train three baselines, and evaluate.
-def run_pipeline(
+def save_results(
+    results_df: pd.DataFrame,
+    results_dir: Path = DEFAULT_RESULTS_DIR,
+) -> Path:
+    """Save model comparison metrics to CSV.
+
+    Parameters
+    ----------
+    results_df : pandas.DataFrame
+        Dataframe containing model evaluation metrics.
+    results_dir : pathlib.Path, default=DEFAULT_RESULTS_DIR
+        Directory where the results CSV should be saved.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the saved CSV file.
+    """
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = results_dir / "baseline_model_comparison.csv"
+    results_df.to_csv(output_path, index=False)
+
+    return output_path
+
+
+def save_model_comparison_plot(
+    results_df: pd.DataFrame,
+    figures_dir: Path = DEFAULT_FIGURES_DIR,
+) -> Path:
+    """Save a bar chart comparing baseline model performance.
+
+    Parameters
+    ----------
+    results_df : pandas.DataFrame
+        Dataframe containing model evaluation metrics.
+    figures_dir : pathlib.Path, default=DEFAULT_FIGURES_DIR
+        Directory where the chart should be saved.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the saved figure.
+    """
+
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = figures_dir / "baseline_model_comparison.png"
+
+    ax = results_df.set_index("Model")[
+        ["Accuracy", "Precision", "Recall", "F1"]
+    ].plot(kind="bar")
+
+    ax.set_title("Model Comparison")
+    ax.set_ylabel("Score")
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+    return output_path
+
+
+def run_baseline_experiment(
         df: pd.DataFrame, 
         test_size: float = 0.2, 
-        random_state: int = 42
-) -> None:
+        random_state: int = 42,
+        results_dir: Path = DEFAULT_RESULTS_DIR,
+        figures_dir: Path = DEFAULT_FIGURES_DIR,
+) -> pd.DataFrame:
+    """Train and evaluate baseline classifiers using TF-IDF features.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Modeling dataframe containing ``text`` and ``label`` columns.
+    test_size : float, default=0.2
+        Fraction of the dataset reserved for testing.
+    random_state : int, default=42
+        Random seed used for reproducible splitting.
+    results_dir : pathlib.Path, default=DEFAULT_RESULTS_DIR
+        Directory where the metrics CSV should be saved.
+    figures_dir : pathlib.Path, default=DEFAULT_FIGURES_DIR
+        Directory where the comparison chart should be saved.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Model evaluation results with accuracy, precision, recall, and F1.
+    """
+    validate_modeling_dataframe(df)
     
-    if df["label"].nunique() < 2:
-        raise ValueError(
-            "The dataset must contain at least two classes for training."
-        )
-        
+    print_section("Training")
+    
     # Split data into training and test sets, stratified by label
     X_train_text, X_test_text, y_train, y_test = train_test_split(
         df["text"], 
@@ -199,7 +481,7 @@ def run_pipeline(
         stratify=df["label"],
     )
 
-    print(f"Train: {len(X_train_text)}  |  Test: {len(X_test_text)}\n")
+    logger.info("Train size: %s | Test size: %s", len(X_train_text), len(X_test_text))
 
     # Build TF-IDF features — fit on train, transform both
     vectorizer = build_tfidf()
@@ -207,30 +489,36 @@ def run_pipeline(
     X_test = transform_tfidf(X_test_text.tolist(), vectorizer)
 
     # Train and evaluate each baseline model
-    models = {
+    models: dict[str, ModelTrainer] = {
         "Logistic Regression": train_logistic_regression,
         "Naive Bayes": train_naive_bayes,
         "SVM (LinearSVC)": train_svm,
     }
-
+    
+    print_section("Model Evaluation")
+    
     print(f"{'Model':<25} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10}")
     print("-" * 67)
 
-    results = []
+    results: list[dict[str, float | str]] = []
 
-    for name, train_fn in models.items():
+    for model_name, train_fn in models.items():
         model = train_fn(X_train, y_train)
         metrics = evaluate_model(model, X_test, y_test)
 
-        results.append({
-            "Model": name,
-            "Accuracy": metrics["accuracy"],
-            "Precision": metrics["precision"],
-            "Recall": metrics["recall"],
-            "F1": metrics["f1"],
-        })
+        results.append(
+            {
+                "Model": model_name,
+                "Accuracy": metrics["accuracy"],
+                "Precision": metrics["precision"],
+                "Recall": metrics["recall"],
+                "F1": metrics["f1"],
+            }
+        )
+        
         print(
-            f"{name:<25} {metrics['accuracy']:>10.4f} "
+            f"{model_name:<25} "
+            f"{metrics['accuracy']:>10.4f} "
             f"{metrics['precision']:>10.4f} "
             f"{metrics['recall']:>10.4f} "
             f"{metrics['f1']:>10.4f}"
@@ -239,33 +527,32 @@ def run_pipeline(
     print()
 
     results_df = pd.DataFrame(results)
+    
+    print_section("Outputs")
 
-    results_dir = PROJECT_ROOT / "reports" / "results"
-    figures_dir = PROJECT_ROOT / "reports" / "figures"
+    results_path = save_results(results_df, results_dir=results_dir)
+    figure_path = save_model_comparison_plot(results_df, figures_dir=figures_dir)
 
-    results_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Saved results to: %s", results_path)
+    logger.info("Saved model comparison figure to: %s", figure_path)
 
-    # Save CSV
-    results_df.to_csv(results_dir / "baseline_model_comparison.csv", index=False)
-
-    # Create chart
-    ax = results_df.set_index("Model")[["Accuracy", "Precision", "Recall", "F1"]].plot(kind="bar")
-    ax.set_title("Model Comparison")
-    ax.set_ylabel("Score")
-    ax.set_ylim(0, 1)
-    plt.tight_layout()
-    plt.savefig(figures_dir / "baseline_model_comparison.png")
-    plt.close()
+    return results_df
 
 
-# Parse CLI arguments and run the full pipeline.
-def main() -> None:
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed command-line arguments.
+    """
+
     parser = argparse.ArgumentParser(
         description="Phishing/Spam Email Classifier",
-        formatter_class=argparse.RawTextHelpFormatter
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    
+
     parser.add_argument(
         "--dataset",
         choices=["enron", "phishing", "csv"],
@@ -282,16 +569,16 @@ def main() -> None:
         "--balanced",
         action="store_true",
         help=(
-            "Apply class balancing (downsample majority class).\n"
+            "Apply class balancing by downsampling majority classes.\n"
             "Useful for imbalanced datasets like phishing detection."
         ),
     )
-    
+
     parser.add_argument(
         "--csv",
         type=str,
         help=(
-            "Path to a pre-processed CSV with 'text' and 'label' columns.\n"
+            "Path to a preprocessed CSV with 'text' and 'label' columns.\n"
             "Required when using --dataset csv."
         ),
     )
@@ -299,50 +586,60 @@ def main() -> None:
     parser.add_argument(
         "--enron",
         type=str,
-        help=(
-            "Path to raw Enron dataset root (expects ham/ and spam/ subdirs)."
-        ),
+        help="Path to raw Enron dataset root.",
     )
 
     parser.add_argument(
         "--nazario",
         type=str,
-        help=(
-            "Path to raw Nazario dataset root (expects .mbox files)."
-        ),
+        help="Path to raw Nazario dataset root.",
     )
 
     parser.add_argument(
         "--test-size",
         type=float,
         default=0.2,
-        help="Fraction of data for testing (default: 0.2)",
+        help="Fraction of data for testing. Default: 0.2.",
     )
 
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed (default: 42)",
+        help="Random seed. Default: 42.",
     )
-    
+
     args = parser.parse_args()
-    
-    # Validate argument combinations
+
     if args.dataset == "csv" and not args.csv:
         parser.error("--dataset csv requires --csv")
 
     if args.dataset == "enron" and args.nazario:
-        print("Warning: --nazario is ignored when using --dataset enron")
+        logger.warning("--nazario is ignored when using --dataset enron.")
 
-    if args.dataset == "csv" and args.balanced:
-        print("Warning: --balanced is ignored when using --dataset csv")
+    if not 0 < args.test_size < 1:
+        parser.error("--test-size must be between 0 and 1.")
 
+    return args
+
+
+def main() -> None:
+    """
+    Run the full command-line pipeline.
+    """
+    configure_logging(logging.INFO)
+    
+    args = parse_args()
+    
     # Load dataset
     df = load_dataframe(args)
 
     # Run pipeline
-    run_pipeline(df, test_size=args.test_size, random_state=args.seed)
+    run_baseline_experiment(
+        df=df, 
+        test_size=args.test_size, 
+        random_state=args.seed
+    )
 
 
 if __name__ == "__main__":

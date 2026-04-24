@@ -54,9 +54,19 @@ def maybe_balance_dataframe(
     counts = df["label"].value_counts()
     min_class_size = counts.min()
 
+    balanced_parts = []
+
+    for label_value in counts.index:
+        label_df = df[df["label"] == label_value]
+        sampled_df = label_df.sample(
+            n=min_class_size,
+            random_state=random_state,
+        )
+        balanced_parts.append(sampled_df)
+
     df_balanced = (
-        df.groupby("label", group_keys=False)
-        .apply(lambda x: x.sample(min_class_size, random_state=random_state))
+        pd.concat(balanced_parts, ignore_index=True)
+        .sample(frac=1, random_state=random_state)
         .reset_index(drop=True)
     )
 
@@ -117,6 +127,12 @@ def build_phishing_dataframe(
 ) -> pd.DataFrame:
     # Keep only legitimate Enron emails
     enron_ham_df = enron_df[enron_df["label"] == 0].copy()
+    
+    print("Enron columns:", enron_ham_df.columns.tolist())
+    print(enron_ham_df.head())
+
+    print("nazario columns:", nazario_df.columns.tolist())
+    print(nazario_df.head())
 
     # Nazario should already be phishing label 1, but copy to be safe
     nazario_df = nazario_df.copy()
@@ -148,17 +164,17 @@ def load_dataframe(args: argparse.Namespace) -> pd.DataFrame:
     else:
         raise ValueError(f"Unsupported dataset option: {args.dataset}")
 
+    print("Before clean:", df.columns.tolist())
     df = clean_loaded_dataframe(df)
+    
+    print("After clean:", df.columns.tolist())
     df = maybe_balance_dataframe(
         df,
         balanced=args.balanced,
         random_state=args.seed,
     )
+    print("After balance:", df.columns.tolist())
 
-    print(
-        f"\nDataset: {len(df)} samples  |  label distribution:\n"
-        f"{df['label'].value_counts().to_string()}\n"
-    )
     return df
 
 
@@ -235,9 +251,9 @@ def run_pipeline(
 
     # Create chart
     ax = results_df.set_index("Model")[["Accuracy", "Precision", "Recall", "F1"]].plot(kind="bar")
-    ax.title("Model Comparison")
-    ax.ylabel("Score")
-    ax.ylim(0, 1)
+    ax.set_title("Model Comparison")
+    ax.set_ylabel("Score")
+    ax.set_ylim(0, 1)
     plt.tight_layout()
     plt.savefig(figures_dir / "baseline_model_comparison.png")
     plt.close()
@@ -324,26 +340,6 @@ def main() -> None:
 
     # Load dataset
     df = load_dataframe(args)
-
-    # Apply balancing if requested
-    if args.balanced:
-        print("Applying class balancing...")
-
-        counts = df["label"].value_counts()
-        min_class_size = counts.min()
-
-        df = (
-            df.groupby("label", group_keys=False)
-                .apply(
-                    lambda x: x.sample(
-                        min_class_size, 
-                        random_state=args.seed,
-                    )
-                )
-                .reset_index(drop=True)
-        )
-
-        print(f"Balanced dataset:\n{df['label'].value_counts().to_string()}\n")
 
     # Run pipeline
     run_pipeline(df, test_size=args.test_size, random_state=args.seed)

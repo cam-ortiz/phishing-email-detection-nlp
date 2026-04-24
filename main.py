@@ -132,7 +132,7 @@ def prepare_modeling_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         cleaned_df.drop_duplicates(subset=["text"])
         .reset_index(drop=True)
     )
-    return df
+    return cleaned_df
 
 
 def balance_classes(df: pd.DataFrame, random_state: int) -> pd.DataFrame:

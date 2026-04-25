@@ -44,6 +44,10 @@ from src.pipeline.data_pipeline import (
     build_nazario_modeling_dataframe,
     print_summary,
 )
+from src.features.linguistic_features import (
+    add_linguistic_features,
+    summarize_linguistic_features,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -520,6 +524,18 @@ def run_baseline_experiment(
     logger.info("Train size: %s | Test size: %s", len(X_train_text), len(X_test_text))
 
     label_names = LABEL_NAMES.get(dataset, ["Class 0", "Class 1"])
+    
+    # Get linguistic feature count for each class
+    df_with_linguistic_features = add_linguistic_features(df)
+
+    linguistic_summary_df = summarize_linguistic_features(
+        df_with_linguistic_features,
+        label_names=label_names,
+    )
+
+    linguistic_summary_path = results_dir / "linguistic_feature_summary.csv"
+    linguistic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    linguistic_summary_df.to_csv(linguistic_summary_path, index=False)
     
     # Build TF-IDF features — fit on train, transform both
     vectorizer = build_tfidf()

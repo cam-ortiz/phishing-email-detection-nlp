@@ -19,7 +19,6 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Callable
-from datetime import datetime
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -32,21 +31,12 @@ from src.models.baseline import (
     train_logistic_regression,
     train_naive_bayes,
     train_svm,
-)
-from src.models.evaluate import (
     evaluate_model,
-    save_confusion_matrix_image,
-    build_classification_report_df,
-    save_classification_report_csv,
 )
 from src.pipeline.data_pipeline import (
     build_enron_modeling_dataframe,
     build_nazario_modeling_dataframe,
     print_summary,
-)
-from src.features.linguistic_features import (
-    add_linguistic_features,
-    summarize_linguistic_features,
 )
 
 
@@ -60,11 +50,6 @@ DEFAULT_NAZARIO_RAW = PROJECT_ROOT / "data" / "raw" / "nazario"
 
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "reports" / "results"
 DEFAULT_FIGURES_DIR = PROJECT_ROOT / "reports" / "figures"
-
-LABEL_NAMES = {
-    "enron": ["Ham", "Spam"],
-    "phishing": ["Legitimate", "Phishing"],
-}
 
 REQUIRED_COLUMNS = {"text", "label"}
 
@@ -395,8 +380,7 @@ def save_results(
     results_df: pd.DataFrame,
     results_dir: Path = DEFAULT_RESULTS_DIR,
 ) -> Path:
-    """
-    Save model comparison metrics to CSV.
+    """Save model comparison metrics to CSV.
 
     Parameters
     ----------
@@ -421,18 +405,14 @@ def save_results(
 
 def save_model_comparison_plot(
     results_df: pd.DataFrame,
-    dataset: str,
     figures_dir: Path = DEFAULT_FIGURES_DIR,
 ) -> Path:
-    """
-    Save a bar chart comparing baseline model performance.
+    """Save a bar chart comparing baseline model performance.
 
     Parameters
     ----------
     results_df : pandas.DataFrame
         Dataframe containing model evaluation metrics.
-    dataset : str
-        Dataset identifier used to map labels for evaluation outputs.
     figures_dir : pathlib.Path, default=DEFAULT_FIGURES_DIR
         Directory where the chart should be saved.
 
@@ -450,8 +430,7 @@ def save_model_comparison_plot(
         ["Accuracy", "Precision", "Recall", "F1"]
     ].plot(kind="bar")
 
-    label_names = LABEL_NAMES.get(dataset, ["Class 0", "Class 1"])
-    ax.set_title(f"Model Comparison ({label_names[0]} vs {label_names[1]})")
+    ax.set_title("Model Comparison")
     ax.set_ylabel("Score")
     ax.set_ylim(0, 1)
 
@@ -464,25 +443,17 @@ def save_model_comparison_plot(
 
 def run_baseline_experiment(
         df: pd.DataFrame, 
-        dataset: str,
-        balanced: bool,
         test_size: float = 0.2, 
         random_state: int = 42,
         results_dir: Path = DEFAULT_RESULTS_DIR,
         figures_dir: Path = DEFAULT_FIGURES_DIR,
 ) -> pd.DataFrame:
-    """
-    Train and evaluate baseline classifiers using TF-IDF features.
+    """Train and evaluate baseline classifiers using TF-IDF features.
 
     Parameters
     ----------
     df : pandas.DataFrame
         Modeling dataframe containing ``text`` and ``label`` columns.
-    dataset : str
-        Dataset name used to determine evaluation label names (e.g., ``"enron"``,
-        ``"phishing"``). Defaults to generic labels for custom datasets.
-    balanced: bool
-        Whether class balancing was applied to the dataset.
     test_size : float, default=0.2
         Fraction of the dataset reserved for testing.
     random_state : int, default=42
@@ -497,17 +468,6 @@ def run_baseline_experiment(
     pandas.DataFrame
         Model evaluation results with accuracy, precision, recall, and F1.
     """
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{run_id}_{dataset}"
-    if balanced:
-        run_name += "_balanced"
-    
-    results_dir = results_dir / run_name
-    figures_dir = figures_dir / run_name
-    
-    results_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    
     validate_modeling_dataframe(df)
     
     print_section("Training")
@@ -523,20 +483,6 @@ def run_baseline_experiment(
 
     logger.info("Train size: %s | Test size: %s", len(X_train_text), len(X_test_text))
 
-    label_names = LABEL_NAMES.get(dataset, ["Class 0", "Class 1"])
-    
-    # Get linguistic feature count for each class
-    df_with_linguistic_features = add_linguistic_features(df)
-
-    linguistic_summary_df = summarize_linguistic_features(
-        df_with_linguistic_features,
-        label_names=label_names,
-    )
-
-    linguistic_summary_path = results_dir / "linguistic_feature_summary.csv"
-    linguistic_summary_path.parent.mkdir(parents=True, exist_ok=True)
-    linguistic_summary_df.to_csv(linguistic_summary_path, index=False)
-    
     # Build TF-IDF features — fit on train, transform both
     vectorizer = build_tfidf()
     X_train = fit_transform_tfidf(X_train_text.tolist(), vectorizer)
@@ -550,7 +496,6 @@ def run_baseline_experiment(
     }
     
     print_section("Model Evaluation")
-    print(f"Classes: {label_names[0]} (0) vs {label_names[1]} (1)\n")
     
     print(f"{'Model':<25} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10}")
     print("-" * 67)
@@ -560,41 +505,7 @@ def run_baseline_experiment(
     for model_name, train_fn in models.items():
         model = train_fn(X_train, y_train)
         metrics = evaluate_model(model, X_test, y_test)
-                
-        safe_model_name = (
-            model_name.lower()
-            .replace(" ", "_")
-            .replace("(", "")
-            .replace(")", "")
-        )
-        
-        confusion_matrix_path = figures_dir / f"{safe_model_name}_confusion_matrix.png"
 
-        title = f"{model_name} Confusion Matrix ({label_names[0]} vs {label_names[1]})"
-
-        save_confusion_matrix_image(
-            model=model,
-            X_test=X_test,
-            y_test=y_test,
-            output_path=confusion_matrix_path,
-            display_labels=label_names,
-            title=title,
-        )
-        
-        report_df = build_classification_report_df(
-            model=model,
-            X_test=X_test,
-            y_test=y_test,
-            target_names=label_names,
-        )
-        
-        report_path = results_dir / f"{safe_model_name}_classification_report.csv"
-
-        save_classification_report_csv(
-            report_df,
-            report_path,
-        )
-        
         results.append(
             {
                 "Model": model_name,
@@ -620,11 +531,7 @@ def run_baseline_experiment(
     print_section("Outputs")
 
     results_path = save_results(results_df, results_dir=results_dir)
-    figure_path = save_model_comparison_plot(
-        results_df,
-        dataset=dataset,
-        figures_dir=figures_dir,
-    )
+    figure_path = save_model_comparison_plot(results_df, figures_dir=figures_dir)
 
     logger.info("Saved results to: %s", results_path)
     logger.info("Saved model comparison figure to: %s", figure_path)
@@ -729,11 +636,9 @@ def main() -> None:
 
     # Run pipeline
     run_baseline_experiment(
-        df=df,
-        dataset=args.dataset,
-        balanced=args.balanced,
-        test_size=args.test_size,
-        random_state=args.seed,
+        df=df, 
+        test_size=args.test_size, 
+        random_state=args.seed
     )
 
 

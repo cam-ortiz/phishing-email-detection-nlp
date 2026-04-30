@@ -1,2 +1,2 @@
 run_id,Model,train_samples,test_samples,epochs,max_length,batch_size,learning_rate,Accuracy,Precision,Recall,F1
-2026-04-24_23-38-53,DistilBERT (fine-tuned),200,9029,1,64,16,2e-05,0.5956362830878281,0.5955466932535726,1.0,0.7465111435117684
+2026-04-29_22-49-21,phishing,DistilBERT (fine-tuned),5425,1357,2,128,16,2e-05,0.9963154016212233,0.9955817378497791,0.9970501474926253,0.9963154016212233

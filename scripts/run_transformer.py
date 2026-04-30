@@ -5,6 +5,10 @@ Mirrors the train/test split used by the baseline pipeline in `main.py`
 (stratified, seed=42, test_size=0.2) so metrics are directly comparable
 to `reports/results/baseline_model_comparison.csv`.
 
+Supported dataset modes (--dataset):
+  enron     - Enron ham vs spam (default)
+  phishing  - Enron ham (legitimate) vs Nazario phishing, class-balanced
+
 Defaults are tuned for laptop-local training on Apple Silicon (MPS):
 - train on a stratified 8,000-row subsample of the training split,
 - evaluate on the FULL held-out test set,
@@ -42,9 +46,15 @@ from src.models.transformer import (
     train_distilbert,
 )
 
-DEFAULT_CSV = PROJECT_ROOT / "data" / "processed" / "enron_clean.csv"
+DEFAULT_ENRON_CSV = PROJECT_ROOT / "data" / "processed" / "enron_clean.csv"
+DEFAULT_NAZARIO_CSV = PROJECT_ROOT / "data" / "processed" / "nazario_clean.csv"
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "reports" / "results"
 DEFAULT_FIGURES_DIR = PROJECT_ROOT / "reports" / "figures"
+
+LABEL_NAMES = {
+    "enron": ("ham (0)", "spam (1)"),
+    "phishing": ("legitimate (0)", "phishing (1)"),
+}
 
 MODEL_DISPLAY_NAME = "DistilBERT (fine-tuned)"
 
@@ -58,10 +68,26 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--csv",
+        "--dataset",
+        choices=["enron", "phishing"],
+        default="enron",
+        help=(
+            "Dataset/task to run:\n"
+            "  enron     Enron ham vs spam (default)\n"
+            "  phishing  Enron ham + Nazario phishing, class-balanced"
+        ),
+    )
+    parser.add_argument(
+        "--enron-csv",
         type=Path,
-        default=DEFAULT_CSV,
-        help=f"Preprocessed CSV with 'text' and 'label'. Default: {DEFAULT_CSV}",
+        default=DEFAULT_ENRON_CSV,
+        help=f"Enron processed CSV. Default: {DEFAULT_ENRON_CSV}",
+    )
+    parser.add_argument(
+        "--nazario-csv",
+        type=Path,
+        default=DEFAULT_NAZARIO_CSV,
+        help=f"Nazario processed CSV. Default: {DEFAULT_NAZARIO_CSV}",
     )
     parser.add_argument(
         "--train-subsample",
@@ -93,21 +119,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_dataset(csv_path: Path) -> pd.DataFrame:
-    logger.info("Loading CSV: %s", csv_path)
-    df = pd.read_csv(csv_path)
-
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["text", "label"])
     df["text"] = df["text"].astype(str)
     df = df[df["text"].str.strip().astype(bool)]
-    df = df.drop_duplicates(subset=["text"]).reset_index(drop=True)
+    return df.drop_duplicates(subset=["text"]).reset_index(drop=True)
+
+
+def load_enron_dataset(csv_path: Path) -> pd.DataFrame:
+    logger.info("Loading Enron CSV: %s", csv_path)
+    df = _clean(pd.read_csv(csv_path))
+    logger.info("Enron: %d rows | %s", len(df), df["label"].value_counts().to_dict())
+    return df
+
+
+def load_phishing_dataset(enron_csv: Path, nazario_csv: Path, seed: int) -> pd.DataFrame:
+    """
+    Build a balanced phishing detection dataset: Enron ham (label=0) vs
+    Nazario phishing (label=1). Downsamples Enron ham to match Nazario size.
+    """
+    enron_df = _clean(pd.read_csv(enron_csv))
+    nazario_df = _clean(pd.read_csv(nazario_csv))
+
+    enron_ham = enron_df[enron_df["label"] == 0][["text"]].copy()
+    enron_ham["label"] = 0
+
+    nazario_phishing = nazario_df[["text"]].copy()
+    nazario_phishing["label"] = 1
+
+    min_size = min(len(enron_ham), len(nazario_phishing))
+    enron_ham = enron_ham.sample(n=min_size, random_state=seed)
+    nazario_phishing = nazario_phishing.sample(n=min_size, random_state=seed)
+
+    df = pd.concat([enron_ham, nazario_phishing], ignore_index=True).sample(
+        frac=1, random_state=seed
+    ).reset_index(drop=True)
 
     logger.info(
-        "Loaded %d rows | label counts: %s",
+        "Phishing dataset: %d rows | %s",
         len(df),
         df["label"].value_counts().to_dict(),
     )
-
     return df
 
 
@@ -147,13 +199,14 @@ def save_confusion_matrix(
     y_pred,
     output_path: Path,
     model_name: str,
+    label_names: tuple[str, str],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cm = confusion_matrix(y_true, y_pred)
     disp = ConfusionMatrixDisplay(
         confusion_matrix=cm,
-        display_labels=("ham (0)", "spam (1)"),
+        display_labels=label_names,
     )
 
     fig, ax = plt.subplots(figsize=(5, 4))
@@ -171,13 +224,19 @@ def main() -> None:
 
     print(f"\n=== DistilBERT Experiment ===")
     print(f"Device:              {get_device()}")
+    print(f"Dataset:             {args.dataset}")
     print(f"Model:               {args.model_name}")
     print(f"Train subsample:     {args.train_subsample or 'FULL'}")
     print(f"Epochs:              {args.epochs}")
     print(f"Batch size:          {args.batch_size}")
     print(f"Max sequence length: {args.max_length}")
 
-    df = load_dataset(args.csv)
+    if args.dataset == "phishing":
+        df = load_phishing_dataset(args.enron_csv, args.nazario_csv, seed=args.seed)
+    else:
+        df = load_enron_dataset(args.enron_csv)
+
+    label_names = LABEL_NAMES[args.dataset]
 
     print(f"\n=== Splitting ===")
     X_train_full, X_test, y_train_full, y_test = train_test_split(
@@ -244,6 +303,7 @@ def main() -> None:
 
     row = {
         "run_id": run_id,
+        "dataset": args.dataset,
         "Model": MODEL_DISPLAY_NAME,
         "train_samples": len(X_train),
         "test_samples": len(X_test),
@@ -260,12 +320,13 @@ def main() -> None:
     append_metrics_row(results_path, row)
     logger.info("Appended metrics to %s", results_path)
 
-    confusion_path = args.figures_dir / "transformer_confusion_matrix.png"
+    confusion_path = args.figures_dir / f"transformer_{args.dataset}_confusion_matrix.png"
     save_confusion_matrix(
         y_true=y_test.tolist(),
         y_pred=metrics["y_pred"],
         output_path=confusion_path,
-        model_name=MODEL_DISPLAY_NAME,
+        model_name=f"{MODEL_DISPLAY_NAME} ({args.dataset})",
+        label_names=label_names,
     )
     logger.info("Saved confusion matrix to %s", confusion_path)
 

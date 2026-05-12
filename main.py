@@ -48,6 +48,18 @@ from src.features.linguistic_features import (
     add_linguistic_features,
     summarize_linguistic_features,
 )
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    classification_report,
+    confusion_matrix,
+)
+
+from src.models.transformer import (
+    TransformerConfig,
+    evaluate_distilbert,
+    get_device,
+    train_distilbert,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -190,6 +202,47 @@ def balance_classes(df: pd.DataFrame, random_state: int) -> pd.DataFrame:
     )
 
     return df_balanced
+
+
+def stratified_subsample(
+    texts: pd.Series,
+    labels: pd.Series,
+    n: int,
+    seed: int,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Return a stratified subsample of the training data.
+
+    Parameters
+    ----------
+    texts : pandas.Series
+        Training text values.
+    labels : pandas.Series
+        Training labels.
+    n : int
+        Number of rows to sample. Use 0 or a value larger than the dataset size
+        to keep the full dataset.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    tuple[pandas.Series, pandas.Series]
+        Subsampled texts and labels.
+    """
+    if n <= 0 or n >= len(texts):
+        return texts, labels
+
+    # train_test_split conveniently gives us a stratified sample.
+    _, sub_texts, _, sub_labels = train_test_split(
+        texts,
+        labels,
+        test_size=n,
+        random_state=seed,
+        stratify=labels,
+    )
+
+    return sub_texts, sub_labels
 
 
 def load_enron_dataframe(args: argparse.Namespace) -> pd.DataFrame:
@@ -632,6 +685,189 @@ def run_baseline_experiment(
     return results_df
 
 
+def run_transformer_experiment(
+    df: pd.DataFrame,
+    dataset: str,
+    balanced: bool,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    train_subsample: int = 8000,
+    epochs: int = 2,
+    batch_size: int = 16,
+    max_length: int = 128,
+    learning_rate: float = 2e-5,
+    model_name: str = "distilbert-base-uncased",
+    results_dir: Path = DEFAULT_RESULTS_DIR,
+    figures_dir: Path = DEFAULT_FIGURES_DIR,
+) -> pd.DataFrame:
+    """
+    Train and evaluate a DistilBERT transformer classifier.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Modeling dataframe containing ``text`` and ``label`` columns.
+    dataset : str
+        Dataset name used to determine label names.
+    balanced : bool
+        Whether class balancing was applied.
+    test_size : float, default=0.2
+        Fraction of the dataset reserved for testing.
+    random_state : int, default=42
+        Random seed.
+    train_subsample : int, default=8000
+        Stratified training subsample size. Use 0 for full training set.
+    epochs : int, default=2
+        Number of fine-tuning epochs.
+    batch_size : int, default=16
+        Transformer batch size.
+    max_length : int, default=128
+        Maximum tokenized sequence length.
+    learning_rate : float, default=2e-5
+        AdamW learning rate.
+    model_name : str, default="distilbert-base-uncased"
+        Hugging Face model name.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Transformer evaluation results.
+    """
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{run_id}_{dataset}_transformer"
+
+    if balanced:
+        run_name += "_balanced"
+
+    results_dir = results_dir / run_name
+    figures_dir = figures_dir / run_name
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    validate_modeling_dataframe(df)
+
+    print_section("Transformer Training Setup")
+
+    X_train_full, X_test, y_train_full, y_test = train_test_split(
+        df["text"],
+        df["label"],
+        test_size=test_size,
+        random_state=random_state,
+        stratify=df["label"],
+    )
+
+    X_train, y_train = stratified_subsample(
+        texts=X_train_full,
+        labels=y_train_full,
+        n=train_subsample,
+        seed=random_state,
+    )
+
+    label_names = LABEL_NAMES.get(dataset, ["Class 0", "Class 1"])
+
+    logger.info("Device: %s", get_device())
+    logger.info("Model: %s", model_name)
+    logger.info("Full train size: %s | Test size: %s", len(X_train_full), len(X_test))
+    logger.info("Training rows used: %s", len(X_train))
+    logger.info("Class names: %s (0) vs %s (1)", label_names[0], label_names[1])
+
+    config = TransformerConfig(
+        model_name=model_name,
+        max_length=max_length,
+        batch_size=batch_size,
+        num_epochs=epochs,
+        learning_rate=learning_rate,
+        num_labels=2,
+        seed=random_state,
+    )
+
+    print_section("Transformer Training")
+
+    model, tokenizer = train_distilbert(
+        texts=X_train.tolist(),
+        labels=y_train.tolist(),
+        config=config,
+    )
+
+    print_section("Transformer Evaluation")
+
+    metrics = evaluate_distilbert(
+        model=model,
+        tokenizer=tokenizer,
+        texts=X_test.tolist(),
+        labels=y_test.tolist(),
+        config=config,
+    )
+
+    print(f"{'Model':<25} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10}")
+    print("-" * 67)
+    print(
+        f"{'DistilBERT':<25} "
+        f"{metrics['accuracy']:>10.4f} "
+        f"{metrics['precision']:>10.4f} "
+        f"{metrics['recall']:>10.4f} "
+        f"{metrics['f1']:>10.4f}"
+    )
+
+    results_df = pd.DataFrame(
+        [
+            {
+                "Model": "DistilBERT",
+                "Accuracy": metrics["accuracy"],
+                "Precision": metrics["precision"],
+                "Recall": metrics["recall"],
+                "F1": metrics["f1"],
+                "train_samples": len(X_train),
+                "test_samples": len(X_test),
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "max_length": max_length,
+                "learning_rate": learning_rate,
+                "model_name": model_name,
+            }
+        ]
+    )
+
+    results_path = results_dir / "transformer_model_comparison.csv"
+    results_df.to_csv(results_path, index=False)
+
+    y_pred = metrics["y_pred"]
+
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=cm,
+        display_labels=label_names,
+    )
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    disp.plot(ax=ax, colorbar=False, values_format="d")
+    ax.set_title(f"DistilBERT Confusion Matrix ({label_names[0]} vs {label_names[1]})")
+    fig.tight_layout()
+
+    confusion_matrix_path = figures_dir / "distilbert_confusion_matrix.png"
+    fig.savefig(confusion_matrix_path, dpi=150)
+    plt.close(fig)
+
+    report_dict = classification_report(
+        y_test,
+        y_pred,
+        target_names=label_names,
+        output_dict=True,
+    )
+
+    report_df = pd.DataFrame(report_dict).transpose()
+    report_path = results_dir / "distilbert_classification_report.csv"
+    report_df.to_csv(report_path)
+
+    print_section("Transformer Outputs")
+    logger.info("Saved transformer results to: %s", results_path)
+    logger.info("Saved transformer confusion matrix to: %s", confusion_matrix_path)
+    logger.info("Saved transformer classification report to: %s", report_path)
+
+    return results_df
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments.
 
@@ -665,6 +901,63 @@ def parse_args() -> argparse.Namespace:
             "Apply class balancing by downsampling majority classes.\n"
             "Useful for imbalanced datasets like phishing detection."
         ),
+    )
+    
+    parser.add_argument(
+        "--model",
+        choices=["baseline", "transformer", "all"],
+        default="baseline",
+        help=(
+            "Model pipeline to run:\n"
+            "  baseline     TF-IDF + classic ML models\n"
+            "  transformer  DistilBERT fine-tuning\n"
+            "  all          run both baseline and transformer"
+        ),
+    )
+
+    parser.add_argument(
+        "--train-subsample",
+        type=int,
+        default=8000,
+        help=(
+            "Transformer-only: stratified training subsample size.\n"
+            "Use 0 to train on the full training split."
+        ),
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=2,
+        help="Transformer-only: number of fine-tuning epochs. Default: 2.",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Transformer-only: batch size. Default: 16.",
+    )
+
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=128,
+        help="Transformer-only: max token sequence length. Default: 128.",
+    )
+
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=2e-5,
+        help="Transformer-only: learning rate. Default: 2e-5.",
+    )
+
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="distilbert-base-uncased",
+        help="Transformer-only: Hugging Face model name.",
     )
 
     parser.add_argument(
@@ -724,17 +1017,32 @@ def main() -> None:
     
     args = parse_args()
     
-    # Load dataset
+    # Load dataset once, then reuse it for whichever model pipeline is selected.
     df = load_dataframe(args)
 
-    # Run pipeline
-    run_baseline_experiment(
-        df=df,
-        dataset=args.dataset,
-        balanced=args.balanced,
-        test_size=args.test_size,
-        random_state=args.seed,
-    )
+    if args.model in {"baseline", "all"}:
+        run_baseline_experiment(
+            df=df,
+            dataset=args.dataset,
+            balanced=args.balanced,
+            test_size=args.test_size,
+            random_state=args.seed,
+        )
+
+    if args.model in {"transformer", "all"}:
+        run_transformer_experiment(
+            df=df,
+            dataset=args.dataset,
+            balanced=args.balanced,
+            test_size=args.test_size,
+            random_state=args.seed,
+            train_subsample=args.train_subsample,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            learning_rate=args.learning_rate,
+            model_name=args.model_name,
+        )
 
 
 if __name__ == "__main__":

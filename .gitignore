@@ -178,3 +178,5 @@ pyrightconfig.json
 data/raw/
 data/processed/
 *.tar.gz
+reports/figures/*
+reports/results/*
